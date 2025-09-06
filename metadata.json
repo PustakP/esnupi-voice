@@ -1,0 +1,8 @@
+{
+  "name": "esnupi voice agent",
+  "description": "record your complaints quickly",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "prompt": ""
+}
