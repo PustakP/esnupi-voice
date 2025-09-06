@@ -15,6 +15,7 @@ export class GdmLiveAudio extends LitElement {
   @state() isRecording = false;
   @state() status = '';
   @state() error = '';
+  @state() conversationState = 'waiting'; // waiting, listening, processing, responding
 
   private client: GoogleGenAI;
   private session: Session;
@@ -26,6 +27,15 @@ export class GdmLiveAudio extends LitElement {
   private sourceNode: MediaStreamAudioSourceNode;
   private scriptProcessorNode: ScriptProcessorNode;
   private sources = new Set<AudioBufferSourceNode>();
+  
+  // vad and audio optimization vars
+  private audioBuffer: Float32Array[] = [];
+  private silenceThreshold = 0.01; // adj for noise sensitivity 
+  private silenceCount = 0;
+  private maxSilenceFrames = 30; // ~0.5s of silence at 60fps
+  private minAudioFrames = 10; // min audio before sending
+  private lastAudioLevel = 0;
+  private isProcessingAudio = false;
 
   // simple linear resampling to 16khz for ai model input
   private resampleTo16kHz(input: Float32Array, inputSampleRate: number): Float32Array {
@@ -56,6 +66,48 @@ export class GdmLiveAudio extends LitElement {
     return output;
   }
 
+  // calc rms audio level for vad
+  private calculateAudioLevel(samples: Float32Array): number {
+    let sum = 0;
+    for (let i = 0; i < samples.length; i++) {
+      sum += samples[i] * samples[i];
+    }
+    return Math.sqrt(sum / samples.length);
+  }
+
+  // detect if audio contains speech vs noise
+  private hasVoiceActivity(audioLevel: number): boolean {
+    return audioLevel > this.silenceThreshold;
+  }
+
+  // send buffered audio chunks efficiently 
+  private sendAudioChunk() {
+    if (this.audioBuffer.length < this.minAudioFrames || this.isProcessingAudio) {
+      return;
+    }
+
+    this.isProcessingAudio = true;
+    
+    // concat all buffered frames
+    const totalLength = this.audioBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
+    const combinedAudio = new Float32Array(totalLength);
+    let offset = 0;
+    
+    for (const chunk of this.audioBuffer) {
+      combinedAudio.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    // send combined chunk and clear buffer
+    this.session.sendRealtimeInput({media: createBlob(combinedAudio)});
+    this.audioBuffer = [];
+    
+    // small delay to prevent overwhelming api
+    setTimeout(() => {
+      this.isProcessingAudio = false;
+    }, 50);
+  }
+
   static styles = css`
     :host {
       display: block;
@@ -74,6 +126,26 @@ export class GdmLiveAudio extends LitElement {
       text-align: center;
       color: white;
       font-size: 14px;
+    }
+
+    .audio-level {
+      position: absolute;
+      bottom: 15vh;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 200px;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 2px;
+      overflow: hidden;
+      z-index: 10;
+    }
+
+    .audio-level-bar {
+      height: 100%;
+      background: linear-gradient(90deg, #00ff00, #ffff00, #ff0000);
+      border-radius: 2px;
+      transition: width 0.1s ease;
     }
 
     .controls {
@@ -157,18 +229,37 @@ export class GdmLiveAudio extends LitElement {
   private async initSession() {
     const model = 'gemini-2.5-flash-preview-native-audio-dialog';
 
+    // sys prompt for complaint-focused conv flow
+    const systemPrompt = `You are a helpful customer service assistant. Your job is to:
+
+1. First, warmly greet the user and ask them to describe their complaint or issue
+2. Once they share their complaint, ask specific follow-up questions to gather more details about ONLY that complaint
+3. Ask one question at a time, keeping responses conversational and empathetic
+4. Focus your questions on understanding: what happened, when it occurred, what they expected vs what they got, how it affected them, and what resolution they're seeking
+5. Stay focused on their specific complaint - don't ask about unrelated topics
+6. Keep responses brief and natural, as if you're having a real conversation
+7. Show understanding and empathy throughout the conversation
+8. IMPORTANT: Respond quickly and concisely. Avoid long pauses or silence.
+9. If you detect background noise or unclear audio, ask the user to repeat their last statement
+
+Start by introducing yourself and asking about their complaint.`;
+
     try {
       this.session = await this.client.live.connect({
         model: model,
         callbacks: {
           onopen: () => {
-            this.updateStatus('Opened');
+            this.updateStatus('Ready to listen to your complaint');
+            this.conversationState = 'waiting';
           },
           onmessage: async (message: LiveServerMessage) => {
             const audio =
               message.serverContent?.modelTurn?.parts[0]?.inlineData;
 
             if (audio && this.audioContext && this.outputNode) {
+              this.conversationState = 'responding';
+              this.updateStatus('Assistant is responding...');
+              
               this.nextStartTime = Math.max(
                 this.nextStartTime,
                 this.audioContext.currentTime,
@@ -185,6 +276,11 @@ export class GdmLiveAudio extends LitElement {
               source.connect(this.outputNode);
               source.addEventListener('ended', () =>{
                 this.sources.delete(source);
+                // when resp finishes, ready for next input
+                if (this.sources.size === 0) {
+                  this.conversationState = 'waiting';
+                  this.updateStatus('Listening for your response...');
+                }
               });
 
               source.start(this.nextStartTime);
@@ -213,6 +309,9 @@ export class GdmLiveAudio extends LitElement {
           speechConfig: {
             voiceConfig: {prebuiltVoiceConfig: {voiceName: 'Orus'}},
             // languageCode: 'en-GB'
+          },
+          systemInstruction: {
+            parts: [{text: systemPrompt}]
           },
         },
       });
@@ -276,17 +375,43 @@ export class GdmLiveAudio extends LitElement {
 
         const inputBuffer = audioProcessingEvent.inputBuffer;
         const pcmData = inputBuffer.getChannelData(0);
+        
+        // calc audio level for vad
+        const audioLevel = this.calculateAudioLevel(pcmData);
+        this.lastAudioLevel = audioLevel;
 
-        // resample to 16khz for ai model input
-        const resampledData = this.resampleTo16kHz(pcmData, this.audioContext.sampleRate);
-        this.session.sendRealtimeInput({media: createBlob(resampledData)});
+        // check for voice activity
+        if (this.hasVoiceActivity(audioLevel)) {
+          this.silenceCount = 0;
+          this.conversationState = 'listening';
+          this.updateStatus('🔴 Capturing your voice...');
+          
+          // resample and buffer audio
+          const resampledData = this.resampleTo16kHz(pcmData, this.audioContext.sampleRate);
+          this.audioBuffer.push(resampledData);
+          
+          // send chunk if buffer is getting full
+          if (this.audioBuffer.length >= 20) { // ~300ms chunks
+            this.sendAudioChunk();
+          }
+        } else {
+          this.silenceCount++;
+          
+          // if we have audio buffered and hit silence, send it
+          if (this.audioBuffer.length > 0 && this.silenceCount >= this.maxSilenceFrames) {
+            this.sendAudioChunk();
+            this.conversationState = 'processing';
+            this.updateStatus('Processing your input...');
+          }
+        }
       };
 
       this.sourceNode.connect(this.scriptProcessorNode);
       this.scriptProcessorNode.connect(this.audioContext.destination);
 
       this.isRecording = true;
-      this.updateStatus('🔴 Recording... Capturing PCM chunks.');
+      this.conversationState = 'listening';
+      this.updateStatus('🔴 Listening to your complaint...');
     } catch (err) {
       console.error('Error starting recording:', err);
       this.updateStatus(`Error: ${err.message}`);
@@ -302,6 +427,11 @@ export class GdmLiveAudio extends LitElement {
 
     this.isRecording = false;
 
+    // send any remaining buffered audio
+    if (this.audioBuffer.length > 0) {
+      this.sendAudioChunk();
+    }
+
     if (this.scriptProcessorNode && this.sourceNode && this.audioContext) {
       this.scriptProcessorNode.disconnect();
       this.sourceNode.disconnect();
@@ -315,16 +445,30 @@ export class GdmLiveAudio extends LitElement {
       this.mediaStream = null;
     }
 
-    this.updateStatus('Recording stopped. Click Start to begin again.');
+    // reset audio processing vars
+    this.audioBuffer = [];
+    this.silenceCount = 0;
+    this.isProcessingAudio = false;
+    
+    this.conversationState = 'processing';
+    this.updateStatus('Processing your input...');
   }
 
   private reset() {
     this.session?.close();
+    
+    // reset all audio processing vars
+    this.audioBuffer = [];
+    this.silenceCount = 0;
+    this.isProcessingAudio = false;
+    this.lastAudioLevel = 0;
+    
     // only reinit session if audio ctx is ready
     if (this.audioContext) {
       this.initSession();
     }
-    this.updateStatus('Session cleared.');
+    this.conversationState = 'waiting';
+    this.updateStatus('Session cleared. Ready for a new complaint.');
   }
 
   render() {
@@ -373,6 +517,10 @@ export class GdmLiveAudio extends LitElement {
           </button>
         </div>
 
+        <div class="audio-level" ?hidden=${!this.isRecording}>
+          <div class="audio-level-bar" style="width: ${Math.min(this.lastAudioLevel * 1000, 100)}%"></div>
+        </div>
+        
         <div id="status"> ${this.error} </div>
         <gdm-live-audio-visuals-simple
           .inputNode=${this.inputNode}
