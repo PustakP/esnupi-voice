@@ -1,5 +1,29 @@
-body {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #100c14;
+}
+
+gdm-live-audio {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+  position: relative;
+}
+
+gdm-live-audio-visuals-3d {
+  display: block;
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  top: 0;
+  left: 0;
 }

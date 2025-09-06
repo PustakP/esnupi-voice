@@ -8,7 +8,7 @@ import {GoogleGenAI, LiveServerMessage, Modality, Session} from '@google/genai';
 import {LitElement, css, html} from 'lit';
 import {customElement, state} from 'lit/decorators.js';
 import {createBlob, decode, decodeAudioData} from './utils';
-import './visual-3d';
+import './visual-simple';
 
 @customElement('gdm-live-audio')
 export class GdmLiveAudio extends LitElement {
@@ -18,19 +18,53 @@ export class GdmLiveAudio extends LitElement {
 
   private client: GoogleGenAI;
   private session: Session;
-  private inputAudioContext = new (window.AudioContext ||
-    window.webkitAudioContext)({sampleRate: 16000});
-  private outputAudioContext = new (window.AudioContext ||
-    window.webkitAudioContext)({sampleRate: 24000});
-  @state() inputNode = this.inputAudioContext.createGain();
-  @state() outputNode = this.outputAudioContext.createGain();
+  private audioContext: AudioContext | null = null;
+  @state() inputNode: GainNode | null = null;
+  @state() outputNode: GainNode | null = null;
   private nextStartTime = 0;
   private mediaStream: MediaStream;
-  private sourceNode: AudioBufferSourceNode;
+  private sourceNode: MediaStreamAudioSourceNode;
   private scriptProcessorNode: ScriptProcessorNode;
   private sources = new Set<AudioBufferSourceNode>();
 
+  // simple linear resampling to 16khz for ai model input
+  private resampleTo16kHz(input: Float32Array, inputSampleRate: number): Float32Array {
+    const outputSampleRate = 16000;
+    
+    // if already at target rate, return as-is
+    if (inputSampleRate === outputSampleRate) {
+      return input;
+    }
+    
+    const ratio = inputSampleRate / outputSampleRate;
+    const outputLength = Math.floor(input.length / ratio);
+    const output = new Float32Array(outputLength);
+    
+    for (let i = 0; i < outputLength; i++) {
+      const srcIndex = i * ratio;
+      const index = Math.floor(srcIndex);
+      const fraction = srcIndex - index;
+      
+      if (index + 1 < input.length) {
+        // linear interpolation
+        output[i] = input[index] * (1 - fraction) + input[index + 1] * fraction;
+      } else {
+        output[i] = input[index] || 0;
+      }
+    }
+    
+    return output;
+  }
+
   static styles = css`
+    :host {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      position: relative;
+      background: #100c14;
+    }
+
     #status {
       position: absolute;
       bottom: 5vh;
@@ -38,6 +72,8 @@ export class GdmLiveAudio extends LitElement {
       right: 0;
       z-index: 10;
       text-align: center;
+      color: white;
+      font-size: 14px;
     }
 
     .controls {
@@ -74,6 +110,15 @@ export class GdmLiveAudio extends LitElement {
         display: none;
       }
     }
+
+    gdm-live-audio-visuals-simple {
+      display: block;
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
   `;
 
   constructor() {
@@ -82,19 +127,31 @@ export class GdmLiveAudio extends LitElement {
   }
 
   private initAudio() {
-    this.nextStartTime = this.outputAudioContext.currentTime;
+    // lazy init audio ctx on user gesture to avoid browser restrictions
+    if (!this.audioContext) {
+      // use system default sample rate to avoid audionode connection issues
+      this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      this.inputNode = this.audioContext.createGain();
+      this.outputNode = this.audioContext.createGain();
+      this.outputNode.connect(this.audioContext.destination);
+    }
+    this.nextStartTime = this.audioContext.currentTime;
   }
 
   private async initClient() {
-    this.initAudio();
+    // check if api key is loaded
+    if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === 'your_api_key_here') {
+      this.updateError('Please set your GEMINI_API_KEY in .env.local file');
+      return;
+    }
 
     this.client = new GoogleGenAI({
       apiKey: process.env.GEMINI_API_KEY,
     });
+    
+    // note: cookie warnings from google ai api are expected and don't affect functionality
 
-    this.outputNode.connect(this.outputAudioContext.destination);
-
-    this.initSession();
+    // dont init session until audio context is ready (user gesture)
   }
 
   private async initSession() {
@@ -111,19 +168,19 @@ export class GdmLiveAudio extends LitElement {
             const audio =
               message.serverContent?.modelTurn?.parts[0]?.inlineData;
 
-            if (audio) {
+            if (audio && this.audioContext && this.outputNode) {
               this.nextStartTime = Math.max(
                 this.nextStartTime,
-                this.outputAudioContext.currentTime,
+                this.audioContext.currentTime,
               );
 
               const audioBuffer = await decodeAudioData(
                 decode(audio.data),
-                this.outputAudioContext,
+                this.audioContext,
                 24000,
                 1,
               );
-              const source = this.outputAudioContext.createBufferSource();
+              const source = this.audioContext.createBufferSource();
               source.buffer = audioBuffer;
               source.connect(this.outputNode);
               source.addEventListener('ended', () =>{
@@ -177,7 +234,20 @@ export class GdmLiveAudio extends LitElement {
       return;
     }
 
-    this.inputAudioContext.resume();
+    // init audio ctx on first user gesture
+    this.initAudio();
+    
+    if (!this.audioContext || !this.inputNode) {
+      this.updateError('Audio context not initialized');
+      return;
+    }
+
+    // init session now that audio ctx is ready
+    if (!this.session) {
+      await this.initSession();
+    }
+
+    await this.audioContext.resume();
 
     this.updateStatus('Requesting microphone access...');
 
@@ -189,13 +259,13 @@ export class GdmLiveAudio extends LitElement {
 
       this.updateStatus('Microphone access granted. Starting capture...');
 
-      this.sourceNode = this.inputAudioContext.createMediaStreamSource(
+      this.sourceNode = this.audioContext.createMediaStreamSource(
         this.mediaStream,
       );
       this.sourceNode.connect(this.inputNode);
 
       const bufferSize = 256;
-      this.scriptProcessorNode = this.inputAudioContext.createScriptProcessor(
+      this.scriptProcessorNode = this.audioContext.createScriptProcessor(
         bufferSize,
         1,
         1,
@@ -207,11 +277,13 @@ export class GdmLiveAudio extends LitElement {
         const inputBuffer = audioProcessingEvent.inputBuffer;
         const pcmData = inputBuffer.getChannelData(0);
 
-        this.session.sendRealtimeInput({media: createBlob(pcmData)});
+        // resample to 16khz for ai model input
+        const resampledData = this.resampleTo16kHz(pcmData, this.audioContext.sampleRate);
+        this.session.sendRealtimeInput({media: createBlob(resampledData)});
       };
 
       this.sourceNode.connect(this.scriptProcessorNode);
-      this.scriptProcessorNode.connect(this.inputAudioContext.destination);
+      this.scriptProcessorNode.connect(this.audioContext.destination);
 
       this.isRecording = true;
       this.updateStatus('🔴 Recording... Capturing PCM chunks.');
@@ -223,14 +295,14 @@ export class GdmLiveAudio extends LitElement {
   }
 
   private stopRecording() {
-    if (!this.isRecording && !this.mediaStream && !this.inputAudioContext)
+    if (!this.isRecording && !this.mediaStream && !this.audioContext)
       return;
 
     this.updateStatus('Stopping recording...');
 
     this.isRecording = false;
 
-    if (this.scriptProcessorNode && this.sourceNode && this.inputAudioContext) {
+    if (this.scriptProcessorNode && this.sourceNode && this.audioContext) {
       this.scriptProcessorNode.disconnect();
       this.sourceNode.disconnect();
     }
@@ -248,7 +320,10 @@ export class GdmLiveAudio extends LitElement {
 
   private reset() {
     this.session?.close();
-    this.initSession();
+    // only reinit session if audio ctx is ready
+    if (this.audioContext) {
+      this.initSession();
+    }
     this.updateStatus('Session cleared.');
   }
 
@@ -299,9 +374,9 @@ export class GdmLiveAudio extends LitElement {
         </div>
 
         <div id="status"> ${this.error} </div>
-        <gdm-live-audio-visuals-3d
+        <gdm-live-audio-visuals-simple
           .inputNode=${this.inputNode}
-          .outputNode=${this.outputNode}></gdm-live-audio-visuals-3d>
+          .outputNode=${this.outputNode}></gdm-live-audio-visuals-simple>
       </div>
     `;
   }
